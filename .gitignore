@@ -1,0 +1,16 @@
+# Downloaded source data
+data/
+
+# Built database and index
+uniprot.sqlite
+mmseqs_db/
+
+# Logs
+*.log
+
+# Build checkpoint flags
+.*_complete
+
+# Temp files
+__pycache__/
+*.pyc
