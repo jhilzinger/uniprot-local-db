@@ -11,10 +11,9 @@ Quick start
 
     db = UniProtDB(
         db_path="/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/uniprot.sqlite",
-        mmseqs_db_path="/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/mmseqs_db/uniref90_mmseqs",
     )
 
-    # Sequence similarity search
+    # Sequence similarity search (DIAMOND, fast)
     hits = db.search_by_sequence(fasta_str)
 
     # Fetch a specific protein
@@ -22,16 +21,11 @@ Quick start
 
     # Domain-based lookup
     proteins = db.search_by_domain(pfam_id="PF00069")
-
-    # Start the MMseqs2 server before heavy usage:
-    #   bash mmseqs_server.sh
 """
 
-import io
 import logging
 import os
 import shutil
-import socket
 import sqlite3
 import subprocess
 import time
@@ -48,8 +42,6 @@ log = logging.getLogger(__name__)
 # UniProt REST API
 _UNIPROT_FASTA_URL = "https://rest.uniprot.org/uniprotkb/{accession}.fasta"
 _RATE_LIMIT_SLEEP  = 0.34          # ≤3 req/s
-_SERVER_PORT       = 8080
-_SERVER_URL        = f"http://localhost:{_SERVER_PORT}"
 
 
 # ---------------------------------------------------------------------------
@@ -75,17 +67,6 @@ def _query_len(fasta_str: str) -> int:
     )
 
 
-def _parse_m8(tsv: str) -> pd.DataFrame:
-    """Parse MMseqs2 m8-format result TSV into a DataFrame."""
-    cols = [
-        "query", "target", "pident", "alnlen", "mismatch",
-        "gapopen", "qstart", "qend", "tstart", "tend", "evalue", "bitscore",
-    ]
-    if not tsv.strip():
-        return pd.DataFrame(columns=cols)
-    return pd.read_csv(io.StringIO(tsv), sep="\t", names=cols, comment="#")
-
-
 # ---------------------------------------------------------------------------
 # UniProtDB class
 # ---------------------------------------------------------------------------
@@ -98,13 +79,35 @@ class UniProtDB:
     ----------
     db_path : str
         Path to uniprot.sqlite
-    mmseqs_db_path : str
-        Path to the MMseqs2 database prefix (e.g. …/mmseqs_db/uniref90_mmseqs)
+    diamond_db_path : str or None
+        Path to the DIAMOND database (.dmnd file).
+        Defaults to <db_dir>/diamond_db/uniref90_diamond.dmnd
+    uniref90_fasta_path : str or None
+        Path to the uncompressed UniRef90 FASTA (required for jackhmmer).
+        Defaults to <db_dir>/data/uniref90.fasta
     """
 
-    def __init__(self, db_path: str, mmseqs_db_path: str) -> None:
-        self.db_path        = db_path
-        self.mmseqs_db_path = mmseqs_db_path
+    def __init__(
+        self,
+        db_path: str,
+        diamond_db_path: Optional[str] = None,
+        uniref90_fasta_path: Optional[str] = None,
+    ) -> None:
+        self.db_path = db_path
+        db_dir = os.path.dirname(db_path)
+
+        if diamond_db_path is None:
+            diamond_db_path = os.path.join(db_dir, "diamond_db", "uniref90_diamond.dmnd")
+        self.diamond_db_path = diamond_db_path
+
+        if uniref90_fasta_path is None:
+            uniref90_fasta_path = os.path.join(db_dir, "data", "uniref90.fasta")
+        self.uniref90_fasta_path = uniref90_fasta_path
+
+        self._diamond_bin = (
+            shutil.which("diamond")
+            or "/usr2/people/jhilzinger/miniforge3/bin/diamond"
+        )
         self._conn: Optional[sqlite3.Connection] = None
 
     # -----------------------------------------------------------------------
@@ -134,28 +137,50 @@ class UniProtDB:
         self.close()
 
     # -----------------------------------------------------------------------
-    # Server management
+    # Status
     # -----------------------------------------------------------------------
 
-    def server_status(self) -> Dict:
+    def diamond_status(self) -> Dict:
         """
-        Returns dict: {running, port, index_path, uptime}.
+        Return availability and configuration info for the DIAMOND search engine.
 
-        Uses a TCP probe so no HTTP round-trip overhead when the server is down.
-        uptime is None (the MMseqs2 server API does not expose it).
+        Returns
+        -------
+        dict: {available, path, db_path, db_exists, db_size_gb, version,
+               jackhmmer: {available, path, uniref90_fasta}}
         """
-        running = False
-        try:
-            with socket.create_connection(("localhost", _SERVER_PORT), timeout=2):
-                running = True
-        except (ConnectionRefusedError, OSError):
-            pass
+        diamond_path = self._diamond_bin
+        available = os.path.isfile(diamond_path) if diamond_path else False
 
+        version = None
+        if available:
+            try:
+                result = subprocess.run(
+                    [diamond_path, "--version"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                version = result.stdout.strip() or result.stderr.strip()
+            except Exception:
+                pass
+
+        db_exists = os.path.isfile(self.diamond_db_path)
+        db_size_gb = None
+        if db_exists:
+            db_size_gb = round(os.path.getsize(self.diamond_db_path) / 1e9, 2)
+
+        jh_path = shutil.which("jackhmmer")
         return {
-            "running":    running,
-            "port":       _SERVER_PORT,
-            "index_path": self.mmseqs_db_path,
-            "uptime":     None,
+            "available":    available,
+            "path":         diamond_path,
+            "db_path":      self.diamond_db_path,
+            "db_exists":    db_exists,
+            "db_size_gb":   db_size_gb,
+            "version":      version,
+            "jackhmmer": {
+                "available":      jh_path is not None,
+                "path":           jh_path,
+                "uniref90_fasta": os.path.isfile(self.uniref90_fasta_path),
+            },
         }
 
     # -----------------------------------------------------------------------
@@ -165,186 +190,291 @@ class UniProtDB:
     def search_by_sequence(
         self,
         fasta_str: str,
-        sensitivity: float = 7.5,
+        mode: str = "fast",
+        sensitivity: str = "sensitive",
         max_hits: int = 100,
         min_identity: float = 0.3,
         min_coverage: float = 0.5,
+        jackhmmer_iterations: int = 3,
+        jackhmmer_evalue: float = 1e-3,
     ) -> pd.DataFrame:
         """
         Search UniRef90 by sequence similarity.
+
+        Parameters
+        ----------
+        mode : "fast" (DIAMOND, default) or "sensitive" (jackhmmer, iterative)
+        sensitivity : DIAMOND sensitivity mode — "fast", "sensitive" (default),
+            "more-sensitive", "very-sensitive", "ultra-sensitive"
+        min_identity, min_coverage : DIAMOND only (fractions, 0–1)
+        jackhmmer_iterations, jackhmmer_evalue : jackhmmer only
 
         Returns
         -------
         DataFrame with columns:
           uniref90_id, rep_accession, evalue, identity, coverage,
           interpro_ids, pfam_ids, member_count, taxonomy_id
+        Note: identity and coverage are NaN for jackhmmer results.
         """
-        status = self.server_status()
-        if status["running"]:
-            tsv = self._search_via_server(fasta_str, sensitivity, max_hits, min_identity, min_coverage)
+        if mode == "sensitive":
+            return self._search_jackhmmer(
+                fasta_str, jackhmmer_iterations, jackhmmer_evalue, max_hits
+            )
+        elif mode == "fast":
+            return self._search_diamond(
+                fasta_str, sensitivity, max_hits, min_identity, min_coverage
+            )
         else:
-            log.info("MMseqs2 server not running — falling back to easy-search subprocess.")
-            tsv = self._search_via_subprocess(fasta_str, sensitivity, max_hits, min_identity, min_coverage)
+            raise ValueError(f"mode must be 'fast' or 'sensitive', got {mode!r}")
 
-        return self._annotate_hits(tsv, fasta_str, min_identity, min_coverage)
-
-    def _search_via_server(
+    def _search_diamond(
         self,
         fasta_str: str,
-        sensitivity: float,
+        sensitivity: str,
         max_hits: int,
         min_identity: float,
         min_coverage: float,
-    ) -> str:
-        """POST to the running MMseqs2 REST server."""
-        # MMseqs2 server accepts plain FASTA as request body.
-        # Parameters are passed as query-string arguments.
-        # NOTE: exact parameter names may vary with MMseqs2 version —
-        #       verify against `mmseqs server --help` output.
-        params = {
-            "sensitivity": sensitivity,
-            "max-seqs":    max_hits,
-            "min-seq-id":  min_identity,
-            "coverage":    min_coverage,
-            "format-output": "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits",
-        }
-        resp = requests.post(
-            f"{_SERVER_URL}/search",
-            data=fasta_str.encode(),
-            params=params,
-            headers={"Content-Type": "text/plain"},
-            timeout=600,
-        )
-        resp.raise_for_status()
-        return resp.text
+    ) -> pd.DataFrame:
+        """Run DIAMOND blastp against the local UniRef90 database."""
+        empty = pd.DataFrame(columns=[
+            "uniref90_id", "rep_accession", "evalue", "identity",
+            "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
+        ])
 
-    def _search_via_subprocess(
-        self,
-        fasta_str: str,
-        sensitivity: float,
-        max_hits: int,
-        min_identity: float,
-        min_coverage: float,
-    ) -> str:
-        """Fallback: run mmseqs easy-search in a uniquely named temp directory."""
-        run_id  = uuid.uuid4().hex
-        tmp_dir = f"/tmp/mmseqs_{run_id}"
+        if not os.path.isfile(self.diamond_db_path):
+            raise FileNotFoundError(
+                f"DIAMOND database not found at {self.diamond_db_path!r}. "
+                "Build it with: diamond makedb --in data/uniref90.fasta "
+                "--db diamond_db/uniref90_diamond --threads 32"
+            )
+
+        run_id     = uuid.uuid4().hex
+        tmp_dir    = f"/tmp/diamond_{run_id}"
+        query_file = os.path.join(tmp_dir, "query.fasta")
+        out_file   = os.path.join(tmp_dir, "results.tsv")
         os.makedirs(tmp_dir, exist_ok=True)
 
+        try:
+            with open(query_file, "w") as fh:
+                fh.write(fasta_str)
+
+            valid_modes = {"fast", "sensitive", "more-sensitive", "very-sensitive", "ultra-sensitive"}
+            if sensitivity not in valid_modes:
+                raise ValueError(f"sensitivity must be one of {valid_modes}, got {sensitivity!r}")
+
+            cmd = [
+                self._diamond_bin, "blastp",
+                "--db",            self.diamond_db_path,
+                "--query",         query_file,
+                "--out",           out_file,
+                "--outfmt", "6", "qseqid", "sseqid", "pident", "length",
+                                  "qcovhsp", "evalue", "bitscore",
+                "--threads",       "8",
+                f"--{sensitivity}",
+                "--max-target-seqs", str(max_hits),
+                "--id",            str(min_identity * 100),
+                "--query-cover",   str(min_coverage * 100),
+                "--quiet",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"diamond blastp failed (exit {proc.returncode}):\n{proc.stderr[-2000:]}"
+                )
+
+            if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
+                return empty
+
+            cols = ["query", "uniref90_id", "pident", "length", "qcovhsp", "evalue", "bitscore"]
+            df = pd.read_csv(out_file, sep="\t", names=cols, comment="#")
+            if df.empty:
+                return empty
+
+            df["identity"] = df["pident"] / 100.0
+            df["coverage"] = df["qcovhsp"] / 100.0
+
+            target_ids = df["uniref90_id"].tolist()
+
+            with self._get_conn() as conn:
+                ph = ",".join("?" * len(target_ids))
+                seq_rows = conn.execute(
+                    f"SELECT uniref90_id, rep_accession, member_count, taxonomy_id"
+                    f" FROM sequences WHERE uniref90_id IN ({ph})",
+                    target_ids,
+                ).fetchall()
+                seq_df = pd.DataFrame([dict(r) for r in seq_rows])
+
+                if seq_df.empty:
+                    return empty
+
+                df = df.merge(seq_df, on="uniref90_id", how="inner")
+
+                rep_accs = df["rep_accession"].dropna().unique().tolist()
+                if rep_accs:
+                    ph2 = ",".join("?" * len(rep_accs))
+                    dom_rows = conn.execute(
+                        f"""SELECT
+                                uniprot_accession,
+                                GROUP_CONCAT(DISTINCT CASE WHEN interpro_id IS NOT NULL
+                                             THEN interpro_id END) AS interpro_ids,
+                                GROUP_CONCAT(DISTINCT CASE WHEN db_name = 'Pfam'
+                                             THEN db_accession END) AS pfam_ids
+                            FROM domains
+                            WHERE uniprot_accession IN ({ph2})
+                            GROUP BY uniprot_accession""",
+                        rep_accs,
+                    ).fetchall()
+                    if dom_rows:
+                        dom_df = pd.DataFrame([dict(r) for r in dom_rows])
+                        dom_df = dom_df.rename(columns={"uniprot_accession": "rep_accession"})
+                        df = df.merge(dom_df, on="rep_accession", how="left")
+                    else:
+                        df["interpro_ids"] = None
+                        df["pfam_ids"]     = None
+                else:
+                    df["interpro_ids"] = None
+                    df["pfam_ids"]     = None
+
+            out_cols = [
+                "uniref90_id", "rep_accession", "evalue", "identity",
+                "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
+            ]
+            for c in out_cols:
+                if c not in df.columns:
+                    df[c] = None
+
+            return df[out_cols].sort_values("evalue").reset_index(drop=True)
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _search_jackhmmer(
+        self,
+        fasta_str: str,
+        iterations: int,
+        evalue: float,
+        max_hits: int,
+    ) -> pd.DataFrame:
+        """Run jackhmmer against the local UniRef90 FASTA, return annotated DataFrame."""
+        empty = pd.DataFrame(columns=[
+            "uniref90_id", "rep_accession", "evalue", "identity",
+            "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
+        ])
+
+        if not os.path.isfile(self.uniref90_fasta_path):
+            raise FileNotFoundError(
+                f"UniRef90 FASTA not found at {self.uniref90_fasta_path!r}. "
+                "Decompress it with: gunzip -k data/uniref90.fasta.gz"
+            )
+
+        run_id = uuid.uuid4().hex
+        tmp_dir = f"/tmp/jackhmmer_{run_id}"
+        os.makedirs(tmp_dir, exist_ok=True)
         query_file  = os.path.join(tmp_dir, "query.fasta")
-        result_file = os.path.join(tmp_dir, "result.tsv")
-        tmp_work    = os.path.join(tmp_dir, "work")
-        os.makedirs(tmp_work)
+        result_file = os.path.join(tmp_dir, "results.tbl")
 
         try:
             with open(query_file, "w") as fh:
                 fh.write(fasta_str)
 
             cmd = [
-                "mmseqs", "easy-search",
+                "jackhmmer",
+                "--cpu",    "8",
+                "--incE",   str(evalue),
+                "-N",       str(iterations),
+                "--tblout", result_file,
+                "--noali",
                 query_file,
-                self.mmseqs_db_path,
-                result_file,
-                tmp_work,
-                "--format-output",
-                "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits",
-                "-s",          str(sensitivity),
-                "--max-seqs",  str(max_hits),
-                "--min-seq-id", str(min_identity),
-                "-c",          str(min_coverage),
-                "--threads",   "8",
+                self.uniref90_fasta_path,
             ]
-            result = subprocess.run(
-                cmd, check=True, capture_output=True, text=True
-            )
-            if result.stderr:
-                log.debug("mmseqs stderr: %s", result.stderr[:500])
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"jackhmmer failed (exit {proc.returncode}):\n{proc.stderr[-2000:]}"
+                )
 
+            # Parse --tblout (whitespace-separated; description may contain spaces)
+            records = []
             if os.path.exists(result_file):
                 with open(result_file) as fh:
-                    return fh.read()
-            return ""
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+                    for line in fh:
+                        if line.startswith("#"):
+                            continue
+                        parts = line.split()
+                        if len(parts) < 5:
+                            continue
+                        try:
+                            hit_evalue = float(parts[4])
+                        except ValueError:
+                            continue
+                        records.append({"uniref90_id": parts[0], "evalue": hit_evalue})
 
-    def _annotate_hits(
-        self,
-        tsv: str,
-        fasta_str: str,
-        min_identity: float,
-        min_coverage: float,
-    ) -> pd.DataFrame:
-        """Parse m8 results and join domain / cluster annotations from SQLite."""
-        empty = pd.DataFrame(columns=[
-            "uniref90_id", "rep_accession", "evalue", "identity",
-            "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
-        ])
-
-        df = _parse_m8(tsv)
-        if df.empty:
-            return empty
-
-        q_len = _query_len(fasta_str) or 1
-
-        df = df.rename(columns={"target": "uniref90_id", "pident": "identity_pct", "evalue": "evalue"})
-        df["identity"] = df["identity_pct"] / 100.0
-        # Query coverage: fraction of query aligned  (qstart/qend are 1-based)
-        df["coverage"] = (df["qend"] - df["qstart"] + 1) / q_len
-
-        df = df[df["identity"] >= min_identity]
-        df = df[df["coverage"] >= min_coverage]
-        if df.empty:
-            return empty
-
-        target_ids = df["uniref90_id"].tolist()
-
-        with self._get_conn() as conn:
-            # --- Sequence cluster metadata ---
-            ph = ",".join("?" * len(target_ids))
-            seq_rows = conn.execute(
-                f"SELECT uniref90_id, rep_accession, member_count, taxonomy_id"
-                f" FROM sequences WHERE uniref90_id IN ({ph})",
-                target_ids,
-            ).fetchall()
-            seq_df = pd.DataFrame([dict(r) for r in seq_rows])
-
-            if seq_df.empty:
+            if not records:
                 return empty
 
-            df = df.merge(seq_df, on="uniref90_id", how="inner")
+            hits_df = (
+                pd.DataFrame(records)
+                .sort_values("evalue")
+                .drop_duplicates("uniref90_id")
+                .head(max_hits)
+            )
+            hits_df["identity"] = float("nan")
+            hits_df["coverage"] = float("nan")
 
-            # --- Domain annotations via rep_accession ---
-            rep_accs = df["rep_accession"].dropna().unique().tolist()
-            if rep_accs:
-                ph2 = ",".join("?" * len(rep_accs))
-                dom_rows = conn.execute(
-                    f"""SELECT
-                            uniprot_accession,
-                            GROUP_CONCAT(DISTINCT CASE WHEN interpro_id IS NOT NULL
-                                         THEN interpro_id END) AS interpro_ids,
-                            GROUP_CONCAT(DISTINCT CASE WHEN db_name = 'Pfam'
-                                         THEN db_accession END) AS pfam_ids
-                        FROM domains
-                        WHERE uniprot_accession IN ({ph2})
-                        GROUP BY uniprot_accession""",
-                    rep_accs,
+            target_ids = hits_df["uniref90_id"].tolist()
+
+            with self._get_conn() as conn:
+                ph = ",".join("?" * len(target_ids))
+                seq_rows = conn.execute(
+                    f"SELECT uniref90_id, rep_accession, member_count, taxonomy_id"
+                    f" FROM sequences WHERE uniref90_id IN ({ph})",
+                    target_ids,
                 ).fetchall()
-                dom_df = pd.DataFrame([dict(r) for r in dom_rows])
-                dom_df = dom_df.rename(columns={"uniprot_accession": "rep_accession"})
-                df = df.merge(dom_df, on="rep_accession", how="left")
-            else:
-                df["interpro_ids"] = None
-                df["pfam_ids"]     = None
+                seq_df = pd.DataFrame([dict(r) for r in seq_rows])
 
-        out_cols = [
-            "uniref90_id", "rep_accession", "evalue", "identity",
-            "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
-        ]
-        for c in out_cols:
-            if c not in df.columns:
-                df[c] = None
+                if seq_df.empty:
+                    return empty
 
-        return df[out_cols].sort_values("evalue").reset_index(drop=True)
+                hits_df = hits_df.merge(seq_df, on="uniref90_id", how="inner")
+
+                rep_accs = hits_df["rep_accession"].dropna().unique().tolist()
+                if rep_accs:
+                    ph2 = ",".join("?" * len(rep_accs))
+                    dom_rows = conn.execute(
+                        f"""SELECT
+                                uniprot_accession,
+                                GROUP_CONCAT(DISTINCT CASE WHEN interpro_id IS NOT NULL
+                                             THEN interpro_id END) AS interpro_ids,
+                                GROUP_CONCAT(DISTINCT CASE WHEN db_name = 'Pfam'
+                                             THEN db_accession END) AS pfam_ids
+                            FROM domains
+                            WHERE uniprot_accession IN ({ph2})
+                            GROUP BY uniprot_accession""",
+                        rep_accs,
+                    ).fetchall()
+                    if dom_rows:
+                        dom_df = pd.DataFrame([dict(r) for r in dom_rows])
+                        dom_df = dom_df.rename(columns={"uniprot_accession": "rep_accession"})
+                        hits_df = hits_df.merge(dom_df, on="rep_accession", how="left")
+                    else:
+                        hits_df["interpro_ids"] = None
+                        hits_df["pfam_ids"]     = None
+                else:
+                    hits_df["interpro_ids"] = None
+                    hits_df["pfam_ids"]     = None
+
+            out_cols = [
+                "uniref90_id", "rep_accession", "evalue", "identity",
+                "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
+            ]
+            for c in out_cols:
+                if c not in hits_df.columns:
+                    hits_df[c] = None
+
+            return hits_df[out_cols].sort_values("evalue").reset_index(drop=True)
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # -----------------------------------------------------------------------
     # Accession lookup

@@ -2,14 +2,15 @@
 """
 Parse protein2ipr.dat.gz into the SQLite `domains` table.
 
-Column layout (tab-separated, 0-based):
+Actual column layout (tab-separated, 0-based):
   0  UniProt accession
   1  InterPro ID       (e.g. IPR000001)
   2  InterPro name
-  3  DB name           (e.g. Pfam, SMART, TIGRFAM …)
-  4  DB accession      (e.g. PF00001)
-  5  Start position    (1-based)
-  6  End position      (1-based inclusive)
+  3  DB accession      (e.g. PF00155, TIGR01821, G3DSA:3.40.640.10)
+  4  Start position    (1-based)
+  5  End position      (1-based inclusive)
+
+db_name is derived from the DB accession prefix.
 
 Only rows whose UniProt accession is already present in the idmapping
 table are inserted (limits table size to sequences we actually have
@@ -35,6 +36,29 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 10_000
+
+# Derive a human-readable db_name from the DB accession prefix.
+# This is needed because uniprotdb.py queries: db_name = 'Pfam' AND db_accession = ?
+_DB_PREFIXES = [
+    ("PF",       "Pfam"),
+    ("PTHR",     "PANTHER"),
+    ("TIGR",     "TIGRFAM"),
+    ("G3DSA:",   "CATH-Gene3D"),
+    ("SSF",      "SUPERFAMILY"),
+    ("PIRSF",    "PIRSF"),
+    ("SM",       "SMART"),
+    ("PS",       "PROSITE"),
+    ("MF_",      "HAMAP"),
+    ("SFLD",     "SFLD"),
+    ("cd",       "CDD"),
+    ("PR",       "PRINTS"),
+]
+
+def _db_name(db_acc: str) -> str:
+    for prefix, name in _DB_PREFIXES:
+        if db_acc.startswith(prefix):
+            return name
+    return db_acc.split(":")[0] if ":" in db_acc else db_acc
 
 
 def open_db(db_path: str) -> sqlite3.Connection:
@@ -80,7 +104,7 @@ def parse_and_insert(dat_gz: str, db_path: str) -> None:
     with gzip.open(dat_gz, "rt") as fh:
         for raw_line in tqdm(fh, desc="protein2ipr lines", unit="lines", mininterval=10.0):
             cols = raw_line.rstrip("\n").split("\t")
-            if len(cols) < 7:
+            if len(cols) < 6:
                 malformed += 1
                 continue
 
@@ -89,19 +113,20 @@ def parse_and_insert(dat_gz: str, db_path: str) -> None:
                 filtered += 1
                 continue
 
+            db_acc = cols[3] or None
             try:
-                start = int(cols[5])
-                end   = int(cols[6])
+                start = int(cols[4])
+                end   = int(cols[5])
             except ValueError:
                 malformed += 1
                 continue
 
             batch.append((
                 ac,
-                cols[1] or None,   # interpro_id  (may be empty if no IPR)
-                cols[2] or None,   # interpro_name
-                cols[3] or None,   # db_name
-                cols[4] or None,   # db_accession
+                cols[1] or None,          # interpro_id
+                cols[2] or None,          # interpro_name
+                _db_name(cols[3]),        # db_name  (derived from accession)
+                db_acc,                   # db_accession
                 start,
                 end,
             ))
