@@ -64,7 +64,7 @@ status = db.search_status()                        # → dict; check shm_ready b
 
 ```bash
 bash /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/load_to_shm.sh
-# ~45 min wall time; ~124 GB copied/decompressed into /opt/shared/jhilzinger/uniprot/
+# ~16 min wall time; ~109 GB copied/decompressed into /opt/shared/jhilzinger/uniprot/
 # Files persist across reboots — only needs to be re-run if files are lost/corrupted
 # Check readiness: db.search_status()["shm_ready"]
 ```
@@ -74,14 +74,14 @@ bash /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/load_to_shm.sh
 | Mode | Engine | Target | Fast storage size | Notes |
 |------|--------|--------|-------------------|-------|
 | `mode="fast"` | DIAMOND | UniRef90 | ~86 GB (.dmnd) | identity/coverage populated |
-| `mode="sensitive"` | jackhmmer | UniRef50 | ~38 GB (.fasta) | identity/coverage NaN |
+| `mode="sensitive"` | jackhmmer | UniRef50 | ~23 GB (.fasta) | identity/coverage NaN |
 
 **Why UniRef50 for jackhmmer:** jackhmmer is for twilight zone (<30% identity) where
-50% vs 90% clustering threshold is irrelevant. UniRef50 is ~38 GB vs 84 GB (UniRef90),
-2.2x smaller. UniRef50 hits map back to UniRef90 clusters via idmapping.uniref50_id.
+50% vs 90% clustering threshold is irrelevant. UniRef50 is ~23 GB vs 84 GB (UniRef90),
+3.6x smaller. UniRef50 hits map back to UniRef90 clusters via idmapping.uniref50_id.
 
 **Fast storage:** /opt/shared/jhilzinger/uniprot/ (local XFS disk, 8.1 TB total,
-2.9 TB free). ~124 GB footprint. Persists across reboots.
+2.8 TB free). ~109 GB footprint. Persists across reboots.
 
 ## NFS files (permanent, source of truth)
 

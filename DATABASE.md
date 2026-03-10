@@ -17,7 +17,7 @@ without external network dependencies.
 | `data/uniref90.fasta.gz` | NFS | Compressed UniRef90 FASTA | ~45 GB |
 | `data/uniref50.fasta.gz` | NFS | Compressed UniRef50 FASTA (jackhmmer source) | ~12 GB |
 | `/opt/shared/jhilzinger/uniprot/uniref90_diamond.dmnd` | local disk | DIAMOND index for runtime search | ~86 GB |
-| `/opt/shared/jhilzinger/uniprot/uniref50.fasta` | local disk | UniRef50 FASTA for jackhmmer | ~38 GB |
+| `/opt/shared/jhilzinger/uniprot/uniref50.fasta` | local disk | UniRef50 FASTA for jackhmmer | ~23 GB |
 
 ---
 
@@ -156,7 +156,7 @@ this divergence level, and (b) UniRef50 is ~23 GB versus 84 GB — 3.6x smaller.
 ### Fast storage management
 
 ```bash
-# Populate once (~45 min; files persist across reboots)
+# Populate once (~16 min; files persist across reboots)
 bash load_to_shm.sh
 
 # Check readiness
