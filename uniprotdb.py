@@ -26,7 +26,7 @@ Quick start
     proteins = db.search_by_domain(pfam_id="PF00069")
 
 Run once to populate fast storage (persistent across reboots):
-    bash load_to_shm.sh
+    bash load_fast_storage.sh
 """
 
 import logging
@@ -107,7 +107,7 @@ class UniProtDB:
     fast_storage_path : str
         Path to the fast local storage directory.
         Default: /opt/shared/jhilzinger/uniprot
-        Expected contents (populated once by load_to_shm.sh):
+        Expected contents (populated once by load_fast_storage.sh):
           uniref90_diamond.dmnd  — DIAMOND index (~86 GB)
           uniref50.fasta         — UniRef50 FASTA for jackhmmer (~38 GB)
         Files persist across reboots (local disk, not RAM).
@@ -158,7 +158,7 @@ class UniProtDB:
         self.close()
 
     def _check_shm(self) -> None:
-        """Raise RuntimeError if required /dev/shm files are missing."""
+        """Raise RuntimeError if required fast storage files are missing."""
         missing = []
         if not os.path.isfile(self.diamond_db_path):
             missing.append(self.diamond_db_path)
@@ -168,7 +168,7 @@ class UniProtDB:
             raise RuntimeError(
                 f"Fast storage files missing from {self.fast_storage_path}:\n"
                 + "\n".join(f"  {f}" for f in missing)
-                + "\nRun load_to_shm.sh to populate fast storage."
+                + "\nRun load_fast_storage.sh to populate fast storage."
             )
 
     # -----------------------------------------------------------------------
@@ -231,8 +231,8 @@ class UniProtDB:
 
         Parameters
         ----------
-        mode : "fast" (DIAMOND against UniRef90 in /dev/shm, default) or
-               "sensitive" (jackhmmer against UniRef50 in /dev/shm)
+        mode : "fast" (DIAMOND against UniRef90 in /opt/shared, default) or
+               "sensitive" (jackhmmer against UniRef50 in /opt/shared)
         sensitivity : DIAMOND only — "fast", "sensitive" (default),
             "more-sensitive", "very-sensitive", "ultra-sensitive"
         min_identity, min_coverage : DIAMOND only (fractions, 0–1)
@@ -263,7 +263,7 @@ class UniProtDB:
         min_identity: float,
         min_coverage: float,
     ) -> pd.DataFrame:
-        """Run DIAMOND blastp against the UniRef90 index in /dev/shm."""
+        """Run DIAMOND blastp against the UniRef90 index in /opt/shared."""
         empty = pd.DataFrame(columns=[
             "uniref90_id", "rep_accession", "evalue", "identity",
             "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
@@ -379,7 +379,7 @@ class UniProtDB:
         max_hits: int,
     ) -> pd.DataFrame:
         """
-        Run jackhmmer against UniRef50 FASTA in /dev/shm.
+        Run jackhmmer against UniRef50 FASTA in /opt/shared.
 
         Hits are UniRef50 IDs; these are mapped to UniRef90 clusters via
         idmapping.uniref50_id before annotation lookup.

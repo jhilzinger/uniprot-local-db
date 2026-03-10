@@ -107,11 +107,11 @@ not during the build). Avoids re-fetching sequences already retrieved.
 ## Sequence Search
 
 Two search modes are available via the `mode` parameter. Both require
-`/opt/shared/jhilzinger/uniprot/` to be populated — run `load_to_shm.sh` once.
+`/opt/shared/jhilzinger/uniprot/` to be populated — run `load_fast_storage.sh` once.
 Files persist across reboots (local disk).
 
 ```bash
-bash load_to_shm.sh   # ~16 min; copies ~109 GB into /opt/shared/jhilzinger/uniprot/
+bash load_fast_storage.sh   # ~16 min; copies ~109 GB into /opt/shared/jhilzinger/uniprot/
 ```
 
 ### Fast search — DIAMOND (mode="fast")
@@ -157,7 +157,7 @@ this divergence level, and (b) UniRef50 is ~23 GB versus 84 GB — 3.6x smaller.
 
 ```bash
 # Populate once (~16 min; files persist across reboots)
-bash load_to_shm.sh
+bash load_fast_storage.sh
 
 # Check readiness
 python3 -c "
@@ -174,7 +174,7 @@ Both DIAMOND and jackhmmer are I/O-bound and perform poorly on NFS.
 Benchmarking on thar confirmed 21–51 MB/sec NFS sequential read rate
 (degraded; healthy NFS ≈ 100–200 MB/sec). Solution: /opt/shared/jhilzinger/uniprot/
 on the local 8.1 TB XFS disk (2.9 TB free). Files persist across reboots;
-load_to_shm.sh needs to be run only once (or to refresh after corruption).
+load_fast_storage.sh needs to be run only once (or to refresh after corruption).
 
 ---
 

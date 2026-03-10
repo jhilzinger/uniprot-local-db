@@ -4,7 +4,7 @@
 - SQLite DB: `/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/uniprot.sqlite`
 - Scripts: `/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/`
 - Python API: `uniprotdb.py`
-- Fast storage (local disk): `/opt/shared/jhilzinger/uniprot/` — populated once by `load_to_shm.sh`; persists across reboots
+- Fast storage (local disk): `/opt/shared/jhilzinger/uniprot/` — populated once by `load_fast_storage.sh`; persists across reboots
 
 ## Data (UniProt/InterPro release 2026-02-25)
 - 188,848,220 UniRef90 cluster representatives with sequences
@@ -38,19 +38,19 @@ db = UniProtDB(
     # fast_storage_path defaults to /opt/shared/jhilzinger/uniprot — omit if using default
 )
 
-# Fast search — DIAMOND against UniRef90 in /dev/shm (~2–8 min)
+# Fast search — DIAMOND against UniRef90 in /opt/shared (~2–8 min)
 hits = db.search_by_sequence(fasta_str, mode="fast", sensitivity="sensitive")
 hits = db.search_by_sequence(fasta_str, mode="fast", sensitivity="fast", max_hits=10)
 # → DataFrame: uniref90_id, rep_accession, evalue, identity, coverage,
 #              interpro_ids, pfam_ids, member_count, taxonomy_id
 
-# Sensitive search — jackhmmer against UniRef50 in /dev/shm (~5–15 min)
+# Sensitive search — jackhmmer against UniRef50 in /opt/shared (~5–15 min)
 hits = db.search_by_sequence(fasta_str, mode="sensitive")
 hits = db.search_by_sequence(fasta_str, mode="sensitive", jackhmmer_iterations=1, max_hits=10)
 # → same DataFrame columns; identity/coverage are NaN
 # UniRef50 hits are resolved to UniRef90 clusters via idmapping.uniref50_id
 
-# Annotation queries (SQLite only, no /dev/shm required)
+# Annotation queries (SQLite only, no fast storage required)
 info  = db.get_by_accession("P04637")             # → dict: sequence, domains, sprot_features, ...
 prots = db.search_by_domain(pfam_id="PF00069")    # → DataFrame
 arch  = db.get_domain_architecture("P04637")      # → list of domain dicts
@@ -63,7 +63,7 @@ status = db.search_status()                        # → dict; check shm_ready b
 ## Populate fast storage (run once)
 
 ```bash
-bash /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/load_to_shm.sh
+bash /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/load_fast_storage.sh
 # ~16 min wall time; ~109 GB copied/decompressed into /opt/shared/jhilzinger/uniprot/
 # Files persist across reboots — only needs to be re-run if files are lost/corrupted
 # Check readiness: db.search_status()["shm_ready"]
@@ -90,7 +90,7 @@ bash /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/load_to_shm.sh
 | `uniprot.sqlite` | ~331 GB | Annotation database |
 | `diamond_db/uniref90_diamond.dmnd` | ~86 GB | DIAMOND index (NFS copy; runtime copy in /opt/shared) |
 | `data/uniref90.fasta.gz` | ~45 GB | Compressed UniRef90 |
-| `data/uniref50.fasta.gz` | ~12 GB | Compressed UniRef50 (source for /dev/shm decompression) |
+| `data/uniref50.fasta.gz` | ~12 GB | Compressed UniRef50 (source for fast storage decompression) |
 
 ## Known Issues / Status
 - ✅ domains table: 1,174,000,000 rows, fully populated (completed 2026-03-09)
@@ -99,7 +99,7 @@ bash /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/load_to_shm.sh
 - ✅ idmapping table: 203,130,941 rows
 - ✅ Fast storage confirmed: /opt/shared/jhilzinger/uniprot/ sanctioned by QB3 sysadmin 2026-03-09
 - ✅ All annotation query methods functional (no fast storage required)
-- Fast storage (/opt/shared/jhilzinger/uniprot/) persists across reboots — run load_to_shm.sh once
+- Fast storage (/opt/shared/jhilzinger/uniprot/) persists across reboots — run load_fast_storage.sh once
 - sequences_cache: empty at build time, populated on demand via fetch_member_sequence()
 - identity/coverage are NaN for jackhmmer results (not reported by --tblout)
 - jackhmmer UniRef50 hits map back to UniRef90 via idmapping.uniref50_id (one extra join)

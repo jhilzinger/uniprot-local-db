@@ -49,3 +49,13 @@ Top hits for P04637: P04637, Q9TTA1, P56423, P56424, P61260 — all TP53/p53 fam
 - DIAMOND and MMseqs2 have the same underlying NFS problem (mmap-based index access)
 - `/dev/shm` is available: 498 GB tmpfs, 498 GB free — could host DIAMOND DB (92 GB) + UniRef90 FASTA (84 GB) in RAM to bypass NFS entirely
 - Copying to `/dev/shm` is a ~30 min one-time cost per reboot; contents lost on reboot
+
+## Resolution (2026-03-09)
+
+`/dev/shm` was rejected because its contents are lost on reboot. Instead, files are
+stored on `/opt/shared/jhilzinger/uniprot/` (local XFS disk, 8.1 TB, sanctioned by
+QB3 sysadmin), which persists across reboots. `load_fast_storage.sh` does the one-time
+copy (~16 min). The jackhmmer target was also switched from UniRef90 (84 GB) to
+UniRef50 (23 GB uncompressed) — 3.6× smaller, negligible sensitivity loss for twilight
+zone detection. Actual measured runtimes: DIAMOND ~9.4 min, jackhmmer ~11.6 min (1 iter,
+P04637 query, validated 2026-03-09).

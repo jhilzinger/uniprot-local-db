@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# load_to_shm.sh — Copy/decompress search index files into fast local storage.
+# load_fast_storage.sh — Copy/decompress search index files into fast local storage.
 #
 # Run once after initial setup, or if files are lost/corrupted.
-# Files are stored on local disk (/opt/shared/jhilzinger/uniprot/) and
+# Files are stored on local XFS disk (/opt/shared/jhilzinger/uniprot/) and
 # persist across reboots — no need to re-run after reboot.
 #
-# Usage: bash load_to_shm.sh [--force]
+# Usage: bash load_fast_storage.sh [--force]
 #   --force : overwrite existing files even if they already exist
 #
 # Files placed in /opt/shared/jhilzinger/uniprot/:
 #   uniref90_diamond.dmnd  (~86 GB)   — copied from NFS diamond_db/
-#   uniref50.fasta         (~38 GB)   — decompressed from NFS data/uniref50.fasta.gz
-# Total footprint: ~124 GB
+#   uniref50.fasta         (~23 GB)   — decompressed from NFS data/uniref50.fasta.gz
+# Total footprint: ~109 GB
 
 set -euo pipefail
 
@@ -37,7 +37,7 @@ done
 # ---------------------------------------------------------------------------
 # Preflight checks
 # ---------------------------------------------------------------------------
-log "load_to_shm.sh: starting — target: $FAST_DIR"
+log "load_fast_storage.sh: starting — target: $FAST_DIR"
 
 if [[ ! -f "$DIAMOND_SRC" ]]; then
     log "ERROR: DIAMOND index not found: $DIAMOND_SRC"
@@ -115,6 +115,6 @@ fi
 # ---------------------------------------------------------------------------
 T_END=$(date +%s)
 WALL=$(( T_END - T0 ))
-log "load_to_shm.sh: complete in ${WALL}s ($(( WALL / 60 )) min)"
+log "load_fast_storage.sh: complete in ${WALL}s ($(( WALL / 60 )) min)"
 log "$(df -h /opt/shared | tail -1)"
 ls -lh "$FAST_DIR" | tee -a "$LOG_FILE"
