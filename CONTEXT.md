@@ -2,15 +2,15 @@
 
 ## Paths
 - SQLite DB: `/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/uniprot.sqlite`
-- DIAMOND db: `/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/diamond_db/uniref90_diamond.dmnd`
 - Scripts: `/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/`
 - Python API: `uniprotdb.py`
+- Fast storage (local disk): `/opt/shared/jhilzinger/uniprot/` — populated once by `load_to_shm.sh`; persists across reboots
 
 ## Data (UniProt/InterPro release 2026-02-25)
 - 188,848,220 UniRef90 cluster representatives with sequences
 - 203,130,941 UniProtKB → UniRef90/50/100 ID mappings
-- 3,532,456 Swiss-Prot functional feature annotations (reviewed proteins only)
-- InterPro domain annotations: **1,174,000,000 rows** (re-parse completed 2026-03-09, bug fix applied 2026-03-03)
+- 3,532,456 Swiss-Prot functional feature annotations (reviewed entries only)
+- 1,174,000,000 InterPro domain annotations (completed 2026-03-09)
 
 ## SQLite Schema
 
@@ -20,7 +20,7 @@ cluster_members  (uniref90_id, member_accession, is_representative)
 idmapping        (uniprot_accession, uniref90_id, uniref50_id, uniref100_id)
 domains          (uniprot_accession, interpro_id, interpro_name, db_name, db_accession, start_pos, end_pos)
 sprot_features   (uniprot_accession, feature_type, start_pos, end_pos, description)
-sequences_cache  (accession PK, sequence, reviewed, fetched_date)  -- populated on demand
+sequences_cache  (accession PK, sequence, reviewed, fetched_date)
 ```
 
 Key indexes: sequences.rep_accession, idmapping.uniprot_accession, idmapping.uniref90_id,
@@ -29,60 +29,93 @@ domains.uniprot_accession, domains.interpro_id, domains.db_name+db_accession
 ## Python API
 
 ```python
+import sys
+sys.path.insert(0, "/auto/sahara/namib/home/jhilzinger/databases/uniprot_db")
 from uniprotdb import UniProtDB
+
 db = UniProtDB(
     db_path="/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/uniprot.sqlite",
-    diamond_db_path="/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/diamond_db/uniref90_diamond.dmnd",
+    # fast_storage_path defaults to /opt/shared/jhilzinger/uniprot — omit if using default
 )
 
-# Fast search (DIAMOND, 2–8 min depending on sensitivity)
-hits   = db.search_by_sequence(fasta_str)                                           # mode="fast", sensitivity="sensitive" default
-hits   = db.search_by_sequence(fasta_str, mode="fast", sensitivity="sensitive")     # → DataFrame: uniref90_id, rep_accession, evalue, identity, coverage, interpro_ids, pfam_ids, member_count, taxonomy_id
-hits   = db.search_by_sequence(fasta_str, mode="fast", sensitivity="fast", max_hits=10)  # faster for testing
+# Fast search — DIAMOND against UniRef90 in /dev/shm (~2–8 min)
+hits = db.search_by_sequence(fasta_str, mode="fast", sensitivity="sensitive")
+hits = db.search_by_sequence(fasta_str, mode="fast", sensitivity="fast", max_hits=10)
+# → DataFrame: uniref90_id, rep_accession, evalue, identity, coverage,
+#              interpro_ids, pfam_ids, member_count, taxonomy_id
 
-# Deep homology search (jackhmmer, iterative profile-profile, ~3-10 min)
-hits   = db.search_by_sequence(fasta_str, mode="sensitive")                         # → same DataFrame columns; identity/coverage are NaN
-hits   = db.search_by_sequence(fasta_str, mode="sensitive", jackhmmer_iterations=1, max_hits=10)  # faster for testing
+# Sensitive search — jackhmmer against UniRef50 in /dev/shm (~5–15 min)
+hits = db.search_by_sequence(fasta_str, mode="sensitive")
+hits = db.search_by_sequence(fasta_str, mode="sensitive", jackhmmer_iterations=1, max_hits=10)
+# → same DataFrame columns; identity/coverage are NaN
+# UniRef50 hits are resolved to UniRef90 clusters via idmapping.uniref50_id
 
-info   = db.get_by_accession("P04637")             # → dict: sequence, domains, sprot_features, cluster_id, is_reviewed, cluster_member_count
-prots  = db.search_by_domain(pfam_id="PF00069")    # → DataFrame: uniprot_accession, uniref90_id, domain_info, start_pos, end_pos, member_count
-arch   = db.get_domain_architecture("P04637")      # → list of dicts: db_name, db_accession, interpro_id, name, start, end
-mems   = db.get_cluster_members("UniRef90_P04637") # → DataFrame: member_accession, is_representative, interpro_ids, pfam_ids
-clust  = db.get_cluster_for_accession("P04637")    # → dict: uniref90_id, rep_accession, member_count, is_representative
-seq    = db.fetch_member_sequence("P04637")        # → str (checks cache, falls back to UniProt REST API)
-status = db.diamond_status()                       # → dict: available, path, db_path, db_exists, db_size_gb, version, jackhmmer
+# Annotation queries (SQLite only, no /dev/shm required)
+info  = db.get_by_accession("P04637")             # → dict: sequence, domains, sprot_features, ...
+prots = db.search_by_domain(pfam_id="PF00069")    # → DataFrame
+arch  = db.get_domain_architecture("P04637")      # → list of domain dicts
+mems  = db.get_cluster_members("UniRef90_P04637") # → DataFrame
+clust = db.get_cluster_for_accession("P04637")    # → dict
+seq   = db.fetch_member_sequence("P04637")        # → str (cache + UniProt REST fallback)
+status = db.search_status()                        # → dict; check shm_ready before searching
 ```
 
-UniRef90 uncompressed FASTA required for jackhmmer: `data/uniref90.fasta` (84 GB).
+## Populate fast storage (run once)
 
-## DIAMOND Search
-DIAMOND is used for fast homology search (replaces MMseqs2, which was NFS-incompatible).
-No server process required — DIAMOND runs as a subprocess, NFS-safe.
-
-Sensitivity modes (pass as `sensitivity=` parameter):
-
-| Mode | Typical runtime | Use case |
-|------|----------------|----------|
-| `fast` | ~1–2 min | Quick screening |
-| `sensitive` | ~3–5 min | Default, recommended |
-| `more-sensitive` | ~5–8 min | Moderate divergence |
-| `very-sensitive` | ~8–15 min | Distant homologs |
-| `ultra-sensitive` | ~15–30 min | Approaches jackhmmer sensitivity |
-
-Rebuild DIAMOND db if needed:
 ```bash
-diamond makedb --in data/uniref90.fasta --db diamond_db/uniref90_diamond --threads 32
+bash /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/load_to_shm.sh
+# ~45 min wall time; ~124 GB copied/decompressed into /opt/shared/jhilzinger/uniprot/
+# Files persist across reboots — only needs to be re-run if files are lost/corrupted
+# Check readiness: db.search_status()["shm_ready"]
 ```
+
+## Search architecture
+
+| Mode | Engine | Target | Fast storage size | Notes |
+|------|--------|--------|-------------------|-------|
+| `mode="fast"` | DIAMOND | UniRef90 | ~86 GB (.dmnd) | identity/coverage populated |
+| `mode="sensitive"` | jackhmmer | UniRef50 | ~38 GB (.fasta) | identity/coverage NaN |
+
+**Why UniRef50 for jackhmmer:** jackhmmer is for twilight zone (<30% identity) where
+50% vs 90% clustering threshold is irrelevant. UniRef50 is ~38 GB vs 84 GB (UniRef90),
+2.2x smaller. UniRef50 hits map back to UniRef90 clusters via idmapping.uniref50_id.
+
+**Fast storage:** /opt/shared/jhilzinger/uniprot/ (local XFS disk, 8.1 TB total,
+2.9 TB free). ~124 GB footprint. Persists across reboots.
+
+## NFS files (permanent, source of truth)
+
+| File | Size | Notes |
+|------|------|-------|
+| `uniprot.sqlite` | ~331 GB | Annotation database |
+| `diamond_db/uniref90_diamond.dmnd` | ~86 GB | DIAMOND index (NFS copy; runtime copy in /opt/shared) |
+| `data/uniref90.fasta.gz` | ~45 GB | Compressed UniRef90 |
+| `data/uniref50.fasta.gz` | ~12 GB | Compressed UniRef50 (source for /dev/shm decompression) |
 
 ## Known Issues / Status
-- `domains` table fully populated: 1,174,000,000 rows (completed 2026-03-09)
-- `sequences_cache` empty at build time, populated on first `fetch_member_sequence()` / `get_by_accession()` call
-- DIAMOND runs as subprocess (no persistent server); NFS-safe
-- jackhmmer searches run synchronously; expect 3–10 min per query against UniRef90
-- identity/coverage columns are NaN for jackhmmer results (not reported by --tblout)
+- ✅ domains table: 1,174,000,000 rows, fully populated (completed 2026-03-09)
+- ✅ sequences table: 188,848,220 rows
+- ✅ sprot_features table: 3,532,456 rows
+- ✅ idmapping table: 203,130,941 rows
+- ✅ Fast storage confirmed: /opt/shared/jhilzinger/uniprot/ sanctioned by QB3 sysadmin 2026-03-09
+- ✅ All annotation query methods functional (no fast storage required)
+- Fast storage (/opt/shared/jhilzinger/uniprot/) persists across reboots — run load_to_shm.sh once
+- sequences_cache: empty at build time, populated on demand via fetch_member_sequence()
+- identity/coverage are NaN for jackhmmer results (not reported by --tblout)
+- jackhmmer UniRef50 hits map back to UniRef90 via idmapping.uniref50_id (one extra join)
 
-## Rebuild a single step
+## Rebuild DIAMOND index
+
 ```bash
-rm /path/to/uniprot_db/.parse_protein2ipr_complete
+diamond makedb \
+  --in data/uniref90.fasta.gz \
+  --db diamond_db/uniref90_diamond \
+  --threads 32
+```
+
+## Rebuild a single pipeline step
+
+```bash
+rm /auto/sahara/namib/home/jhilzinger/databases/uniprot_db/.parse_protein2ipr_complete
 bash build_database.sh   # skips all other completed steps
 ```

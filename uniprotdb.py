@@ -13,7 +13,10 @@ Quick start
         db_path="/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/uniprot.sqlite",
     )
 
-    # Sequence similarity search (DIAMOND, fast)
+    # Check fast storage readiness before searching
+    print(db.search_status())
+
+    # Sequence similarity search (DIAMOND, fast) — requires fast storage populated
     hits = db.search_by_sequence(fasta_str)
 
     # Fetch a specific protein
@@ -21,6 +24,9 @@ Quick start
 
     # Domain-based lookup
     proteins = db.search_by_domain(pfam_id="PF00069")
+
+Run once to populate fast storage (persistent across reboots):
+    bash load_to_shm.sh
 """
 
 import logging
@@ -67,6 +73,25 @@ def _query_len(fasta_str: str) -> int:
     )
 
 
+def _file_size_gb(path: str) -> Optional[float]:
+    """Return file size in GB, or None if the file does not exist."""
+    if os.path.isfile(path):
+        return round(os.path.getsize(path) / 1e9, 2)
+    return None
+
+
+def _run_version(binary: str, *args) -> Optional[str]:
+    """Run `binary --version` (or custom args) and return stdout/stderr, or None."""
+    try:
+        result = subprocess.run(
+            [binary] + list(args),
+            capture_output=True, text=True, timeout=10,
+        )
+        return (result.stdout.strip() or result.stderr.strip()) or None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # UniProtDB class
 # ---------------------------------------------------------------------------
@@ -79,30 +104,26 @@ class UniProtDB:
     ----------
     db_path : str
         Path to uniprot.sqlite
-    diamond_db_path : str or None
-        Path to the DIAMOND database (.dmnd file).
-        Defaults to <db_dir>/diamond_db/uniref90_diamond.dmnd
-    uniref90_fasta_path : str or None
-        Path to the uncompressed UniRef90 FASTA (required for jackhmmer).
-        Defaults to <db_dir>/data/uniref90.fasta
+    fast_storage_path : str
+        Path to the fast local storage directory.
+        Default: /opt/shared/jhilzinger/uniprot
+        Expected contents (populated once by load_to_shm.sh):
+          uniref90_diamond.dmnd  — DIAMOND index (~86 GB)
+          uniref50.fasta         — UniRef50 FASTA for jackhmmer (~38 GB)
+        Files persist across reboots (local disk, not RAM).
     """
 
     def __init__(
         self,
         db_path: str,
-        diamond_db_path: Optional[str] = None,
-        uniref90_fasta_path: Optional[str] = None,
+        fast_storage_path: str = "/opt/shared/jhilzinger/uniprot",
     ) -> None:
-        self.db_path = db_path
-        db_dir = os.path.dirname(db_path)
+        self.db_path          = db_path
+        self.shm_path         = fast_storage_path   # legacy alias kept for search_status()
+        self.fast_storage_path = fast_storage_path
 
-        if diamond_db_path is None:
-            diamond_db_path = os.path.join(db_dir, "diamond_db", "uniref90_diamond.dmnd")
-        self.diamond_db_path = diamond_db_path
-
-        if uniref90_fasta_path is None:
-            uniref90_fasta_path = os.path.join(db_dir, "data", "uniref90.fasta")
-        self.uniref90_fasta_path = uniref90_fasta_path
+        self.diamond_db_path    = os.path.join(fast_storage_path, "uniref90_diamond.dmnd")
+        self.uniref50_fasta_path = os.path.join(fast_storage_path, "uniref50.fasta")
 
         self._diamond_bin = (
             shutil.which("diamond")
@@ -136,50 +157,57 @@ class UniProtDB:
     def __exit__(self, *_):
         self.close()
 
+    def _check_shm(self) -> None:
+        """Raise RuntimeError if required /dev/shm files are missing."""
+        missing = []
+        if not os.path.isfile(self.diamond_db_path):
+            missing.append(self.diamond_db_path)
+        if not os.path.isfile(self.uniref50_fasta_path):
+            missing.append(self.uniref50_fasta_path)
+        if missing:
+            raise RuntimeError(
+                f"Fast storage files missing from {self.fast_storage_path}:\n"
+                + "\n".join(f"  {f}" for f in missing)
+                + "\nRun load_to_shm.sh to populate fast storage."
+            )
+
     # -----------------------------------------------------------------------
     # Status
     # -----------------------------------------------------------------------
 
-    def diamond_status(self) -> Dict:
+    def search_status(self) -> Dict:
         """
-        Return availability and configuration info for the DIAMOND search engine.
+        Return readiness status for both search engines.
 
         Returns
         -------
-        dict: {available, path, db_path, db_exists, db_size_gb, version,
-               jackhmmer: {available, path, uniref90_fasta}}
+        dict: {
+            shm_path, shm_ready,
+            diamond: {available, version, index_in_shm, index_size_gb},
+            jackhmmer: {available, version, fasta_in_shm, fasta_size_gb},
+        }
         """
-        diamond_path = self._diamond_bin
-        available = os.path.isfile(diamond_path) if diamond_path else False
-
-        version = None
-        if available:
-            try:
-                result = subprocess.run(
-                    [diamond_path, "--version"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                version = result.stdout.strip() or result.stderr.strip()
-            except Exception:
-                pass
-
-        db_exists = os.path.isfile(self.diamond_db_path)
-        db_size_gb = None
-        if db_exists:
-            db_size_gb = round(os.path.getsize(self.diamond_db_path) / 1e9, 2)
-
+        diamond_bin = self._diamond_bin
+        diamond_avail = bool(diamond_bin and os.path.isfile(diamond_bin))
         jh_path = shutil.which("jackhmmer")
+
         return {
-            "available":    available,
-            "path":         diamond_path,
-            "db_path":      self.diamond_db_path,
-            "db_exists":    db_exists,
-            "db_size_gb":   db_size_gb,
-            "version":      version,
+            "fast_storage_path": self.fast_storage_path,
+            "shm_ready": (
+                os.path.isfile(self.diamond_db_path) and
+                os.path.isfile(self.uniref50_fasta_path)
+            ),
+            "diamond": {
+                "available":     diamond_avail,
+                "version":       _run_version(diamond_bin, "--version") if diamond_avail else None,
+                "index_in_shm":  os.path.isfile(self.diamond_db_path),
+                "index_size_gb": _file_size_gb(self.diamond_db_path),
+            },
             "jackhmmer": {
-                "available":      jh_path is not None,
-                "path":           jh_path,
-                "uniref90_fasta": os.path.isfile(self.uniref90_fasta_path),
+                "available":     jh_path is not None,
+                "version":       _run_version(jh_path, "-h") if jh_path else None,
+                "fasta_in_shm":  os.path.isfile(self.uniref50_fasta_path),
+                "fasta_size_gb": _file_size_gb(self.uniref50_fasta_path),
             },
         }
 
@@ -199,21 +227,21 @@ class UniProtDB:
         jackhmmer_evalue: float = 1e-3,
     ) -> pd.DataFrame:
         """
-        Search UniRef90 by sequence similarity.
+        Search by sequence similarity.
 
         Parameters
         ----------
-        mode : "fast" (DIAMOND, default) or "sensitive" (jackhmmer, iterative)
-        sensitivity : DIAMOND sensitivity mode — "fast", "sensitive" (default),
+        mode : "fast" (DIAMOND against UniRef90 in /dev/shm, default) or
+               "sensitive" (jackhmmer against UniRef50 in /dev/shm)
+        sensitivity : DIAMOND only — "fast", "sensitive" (default),
             "more-sensitive", "very-sensitive", "ultra-sensitive"
         min_identity, min_coverage : DIAMOND only (fractions, 0–1)
         jackhmmer_iterations, jackhmmer_evalue : jackhmmer only
 
         Returns
         -------
-        DataFrame with columns:
-          uniref90_id, rep_accession, evalue, identity, coverage,
-          interpro_ids, pfam_ids, member_count, taxonomy_id
+        DataFrame: uniref90_id, rep_accession, evalue, identity, coverage,
+                   interpro_ids, pfam_ids, member_count, taxonomy_id
         Note: identity and coverage are NaN for jackhmmer results.
         """
         if mode == "sensitive":
@@ -235,18 +263,17 @@ class UniProtDB:
         min_identity: float,
         min_coverage: float,
     ) -> pd.DataFrame:
-        """Run DIAMOND blastp against the local UniRef90 database."""
+        """Run DIAMOND blastp against the UniRef90 index in /dev/shm."""
         empty = pd.DataFrame(columns=[
             "uniref90_id", "rep_accession", "evalue", "identity",
             "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
         ])
 
-        if not os.path.isfile(self.diamond_db_path):
-            raise FileNotFoundError(
-                f"DIAMOND database not found at {self.diamond_db_path!r}. "
-                "Build it with: diamond makedb --in data/uniref90.fasta "
-                "--db diamond_db/uniref90_diamond --threads 32"
-            )
+        self._check_shm()
+
+        valid_modes = {"fast", "sensitive", "more-sensitive", "very-sensitive", "ultra-sensitive"}
+        if sensitivity not in valid_modes:
+            raise ValueError(f"sensitivity must be one of {valid_modes}, got {sensitivity!r}")
 
         run_id     = uuid.uuid4().hex
         tmp_dir    = f"/tmp/diamond_{run_id}"
@@ -257,10 +284,6 @@ class UniProtDB:
         try:
             with open(query_file, "w") as fh:
                 fh.write(fasta_str)
-
-            valid_modes = {"fast", "sensitive", "more-sensitive", "very-sensitive", "ultra-sensitive"}
-            if sensitivity not in valid_modes:
-                raise ValueError(f"sensitivity must be one of {valid_modes}, got {sensitivity!r}")
 
             cmd = [
                 self._diamond_bin, "blastp",
@@ -355,17 +378,18 @@ class UniProtDB:
         evalue: float,
         max_hits: int,
     ) -> pd.DataFrame:
-        """Run jackhmmer against the local UniRef90 FASTA, return annotated DataFrame."""
+        """
+        Run jackhmmer against UniRef50 FASTA in /dev/shm.
+
+        Hits are UniRef50 IDs; these are mapped to UniRef90 clusters via
+        idmapping.uniref50_id before annotation lookup.
+        """
         empty = pd.DataFrame(columns=[
             "uniref90_id", "rep_accession", "evalue", "identity",
             "coverage", "interpro_ids", "pfam_ids", "member_count", "taxonomy_id",
         ])
 
-        if not os.path.isfile(self.uniref90_fasta_path):
-            raise FileNotFoundError(
-                f"UniRef90 FASTA not found at {self.uniref90_fasta_path!r}. "
-                "Decompress it with: gunzip -k data/uniref90.fasta.gz"
-            )
+        self._check_shm()
 
         run_id = uuid.uuid4().hex
         tmp_dir = f"/tmp/jackhmmer_{run_id}"
@@ -385,7 +409,7 @@ class UniProtDB:
                 "--tblout", result_file,
                 "--noali",
                 query_file,
-                self.uniref90_fasta_path,
+                self.uniref50_fasta_path,
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
@@ -393,7 +417,7 @@ class UniProtDB:
                     f"jackhmmer failed (exit {proc.returncode}):\n{proc.stderr[-2000:]}"
                 )
 
-            # Parse --tblout (whitespace-separated; description may contain spaces)
+            # Parse --tblout: col 0 = UniRef50 ID, col 4 = evalue
             records = []
             if os.path.exists(result_file):
                 with open(result_file) as fh:
@@ -407,36 +431,52 @@ class UniProtDB:
                             hit_evalue = float(parts[4])
                         except ValueError:
                             continue
-                        records.append({"uniref90_id": parts[0], "evalue": hit_evalue})
+                        records.append({"uniref50_id": parts[0], "evalue": hit_evalue})
 
             if not records:
                 return empty
 
-            hits_df = (
+            # Deduplicate UniRef50 hits, sort by evalue
+            hits50 = (
                 pd.DataFrame(records)
                 .sort_values("evalue")
+                .drop_duplicates("uniref50_id")
+            )
+            uniref50_ids = hits50["uniref50_id"].tolist()
+
+            # Map UniRef50 IDs → UniRef90 clusters via idmapping
+            with self._get_conn() as conn:
+                ph = ",".join("?" * len(uniref50_ids))
+                map_rows = conn.execute(
+                    f"""SELECT DISTINCT i.uniref50_id, i.uniref90_id,
+                               s.rep_accession, s.member_count, s.taxonomy_id
+                        FROM idmapping i
+                        JOIN sequences s ON s.uniref90_id = i.uniref90_id
+                        WHERE i.uniref50_id IN ({ph})""",
+                    uniref50_ids,
+                ).fetchall()
+
+            if not map_rows:
+                return empty
+
+            map_df = pd.DataFrame([dict(r) for r in map_rows])
+
+            # Merge evalue from UniRef50 hit into each UniRef90 row
+            hits_df = map_df.merge(hits50[["uniref50_id", "evalue"]], on="uniref50_id", how="left")
+
+            # Deduplicate by uniref90_id (keep best evalue), limit to max_hits
+            hits_df = (
+                hits_df.sort_values("evalue")
                 .drop_duplicates("uniref90_id")
                 .head(max_hits)
+                .reset_index(drop=True)
             )
+
             hits_df["identity"] = float("nan")
             hits_df["coverage"] = float("nan")
 
-            target_ids = hits_df["uniref90_id"].tolist()
-
+            # Attach domain annotations
             with self._get_conn() as conn:
-                ph = ",".join("?" * len(target_ids))
-                seq_rows = conn.execute(
-                    f"SELECT uniref90_id, rep_accession, member_count, taxonomy_id"
-                    f" FROM sequences WHERE uniref90_id IN ({ph})",
-                    target_ids,
-                ).fetchall()
-                seq_df = pd.DataFrame([dict(r) for r in seq_rows])
-
-                if seq_df.empty:
-                    return empty
-
-                hits_df = hits_df.merge(seq_df, on="uniref90_id", how="inner")
-
                 rep_accs = hits_df["rep_accession"].dropna().unique().tolist()
                 if rep_accs:
                     ph2 = ",".join("?" * len(rep_accs))

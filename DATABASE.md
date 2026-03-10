@@ -4,17 +4,20 @@ A self-contained, locally-hosted reference database built from public UniProt/Un
 and InterPro data. Provides fast sequence similarity search and protein annotation lookup
 without external network dependencies.
 
-**Built:** 2026-03-03 | **Updated:** 2026-03-03 (DIAMOND migration) | **Runtime:** 137 h 12 m | **Total size:** ~323 GB on disk
+**Built:** 2026-03-03 | **Updated:** 2026-03-09 (search architecture) | **Runtime:** 137 h 12 m | **Total size:** ~486 GB on NFS + ~109 GB on /opt/shared
 
 ---
 
 ## Contents
 
-| Component | Description | Size on disk |
-|-----------|-------------|-------------|
-| `uniprot.sqlite` | Annotation database (SQLite) | 147 GB |
-| `diamond_db/` | DIAMOND sequence index for fast search | 92 GB |
-| `data/uniref90.fasta` | Uncompressed UniRef90 FASTA (required for jackhmmer) | 84 GB |
+| Component | Location | Description | Size |
+|-----------|----------|-------------|------|
+| `uniprot.sqlite` | NFS | Annotation database (SQLite) | ~331 GB |
+| `diamond_db/uniref90_diamond.dmnd` | NFS | DIAMOND sequence index (NFS copy) | ~86 GB |
+| `data/uniref90.fasta.gz` | NFS | Compressed UniRef90 FASTA | ~45 GB |
+| `data/uniref50.fasta.gz` | NFS | Compressed UniRef50 FASTA (jackhmmer source) | ~12 GB |
+| `/opt/shared/jhilzinger/uniprot/uniref90_diamond.dmnd` | local disk | DIAMOND index for runtime search | ~86 GB |
+| `/opt/shared/jhilzinger/uniprot/uniref50.fasta` | local disk | UniRef50 FASTA for jackhmmer | ~38 GB |
 
 ---
 
@@ -103,14 +106,19 @@ not during the build). Avoids re-fetching sequences already retrieved.
 
 ## Sequence Search
 
-Two search engines are available, selectable via the `mode` parameter.
+Two search modes are available via the `mode` parameter. Both require
+`/opt/shared/jhilzinger/uniprot/` to be populated — run `load_to_shm.sh` once.
+Files persist across reboots (local disk).
 
-### Fast search — DIAMOND
+```bash
+bash load_to_shm.sh   # ~16 min; copies ~109 GB into /opt/shared/jhilzinger/uniprot/
+```
 
-Uses a precomputed DIAMOND protein database (`diamond_db/uniref90_diamond.dmnd`)
-for searches that typically complete in 2–8 minutes depending on sensitivity mode.
-DIAMOND performs sequential disk reads and is fully compatible with NFS storage.
-No persistent server process required.
+### Fast search — DIAMOND (mode="fast")
+
+DIAMOND protein search against the UniRef90 index on local disk.
+NFS reads of the 86 GB index are impractical (~45 min measured); local XFS disk
+(/opt/shared/jhilzinger/uniprot/) reduces typical search time to 2–8 minutes.
 
 Sensitivity modes (pass as `sensitivity=` parameter):
 
@@ -122,24 +130,51 @@ Sensitivity modes (pass as `sensitivity=` parameter):
 | `very-sensitive` | ~8–15 min | Distant homologs |
 | `ultra-sensitive` | ~15–30 min | Approaches jackhmmer sensitivity |
 
-To rebuild the DIAMOND database if needed:
+Returns: uniref90_id, rep_accession, evalue, identity, coverage,
+         interpro_ids, pfam_ids, member_count, taxonomy_id
+
+To rebuild the DIAMOND index if needed:
 ```bash
 diamond makedb \
-  --in data/uniref90.fasta \
+  --in data/uniref90.fasta.gz \
   --db diamond_db/uniref90_diamond \
   --threads 32
 ```
 
-### Sensitive search — jackhmmer
+### Sensitive search — jackhmmer (mode="sensitive")
 
-Uses [HMMER](http://hmmer.org/) `jackhmmer` for iterative profile-profile search
-against `data/uniref90.fasta`. More sensitive than MMseqs2 for distant homologs
-(e.g. <30% identity). Reads the FASTA sequentially, so it performs well on NFS.
-Typical runtime: **3–15 minutes per query**.
+Iterative profile-profile search against UniRef50 FASTA on local disk.
+Used for twilight zone detection (<30% identity). UniRef50 was chosen over
+UniRef90 because: (a) 50% vs 90% clustering threshold is irrelevant at
+this divergence level, and (b) UniRef50 is ~23 GB versus 84 GB — 3.6x smaller.
 
 - Installed at: `/usr/bin/jackhmmer` (HMMER 3.3.2)
-- Does **not** require the MMseqs2 server to be running
+- UniRef50 hits are resolved to UniRef90 clusters via `idmapping.uniref50_id`
+- Typical runtime: **5–15 minutes per query** against UniRef50 in /opt/shared
 - `identity` and `coverage` columns are `NaN` in results (not reported by jackhmmer)
+
+### Fast storage management
+
+```bash
+# Populate once (~45 min; files persist across reboots)
+bash load_to_shm.sh
+
+# Check readiness
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from uniprotdb import UniProtDB
+db = UniProtDB(db_path='uniprot.sqlite')
+import json; print(json.dumps(db.search_status(), indent=2))
+"
+```
+
+### NFS incompatibility — background
+
+Both DIAMOND and jackhmmer are I/O-bound and perform poorly on NFS.
+Benchmarking on thar confirmed 21–51 MB/sec NFS sequential read rate
+(degraded; healthy NFS ≈ 100–200 MB/sec). Solution: /opt/shared/jhilzinger/uniprot/
+on the local 8.1 TB XFS disk (2.9 TB free). Files persist across reboots;
+load_to_shm.sh needs to be run only once (or to refresh after corruption).
 
 ---
 
@@ -153,13 +188,16 @@ from uniprotdb import UniProtDB
 
 db = UniProtDB(
     db_path="/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/uniprot.sqlite",
-    diamond_db_path="/auto/sahara/namib/home/jhilzinger/databases/uniprot_db/diamond_db/uniref90_diamond.dmnd",
+    # fast_storage_path defaults to /opt/shared/jhilzinger/uniprot — omit if using default
 )
 
-# Fast sequence search (DIAMOND) — 2–8 min depending on sensitivity
+# Check fast storage readiness before searching
+status = db.search_status()   # shm_ready=True when both files are in /opt/shared
+
+# Fast sequence search (DIAMOND) — 2–8 min; requires fast storage populated
 hits = db.search_by_sequence(fasta_str, mode="fast", sensitivity="sensitive", max_hits=100)
 
-# Sensitive sequence search (jackhmmer) — 3–15 min, better for distant homologs
+# Sensitive sequence search (jackhmmer against UniRef50) — 5–15 min; requires fast storage
 hits = db.search_by_sequence(fasta_str, mode="sensitive", jackhmmer_iterations=3)
 
 # Look up a specific protein
@@ -185,10 +223,18 @@ Both modes return a DataFrame with identical columns:
 
 The original MMseqs2 index (`mmseqs_db/`, 619 GB) was removed due to incompatibility
 with NFS-mounted storage (memory-mapped index files cause severe performance degradation
-on NFS). DIAMOND replaces it as the fast search engine. DIAMOND performs sequential
-disk reads and is fully NFS-compatible. The MMseqs2 index is not recoverable from
-existing data but can be rebuilt with `mmseqs createdb` + `mmseqs createindex` if
-local (non-NFS) storage becomes available.
+on NFS). DIAMOND replaced it as the fast search engine.
+
+### DIAMOND NFS performance → /opt/shared architecture (2026-03-09)
+
+Although DIAMOND performs sequential disk reads (NFS-safe in principle), the 86 GB
+index requires ~45 min of sequential NFS reads per query — impractical for interactive
+use. Solution: copy the DIAMOND index and UniRef50 FASTA to /opt/shared/jhilzinger/uniprot/
+(local XFS disk). This reduces search time from ~45 min to ~9 min (DIAMOND) and
+5–15 min (jackhmmer). The jackhmmer target was switched from UniRef90 (84 GB) to
+UniRef50 (23 GB uncompressed) — 3.6x smaller with negligible sensitivity loss for distant
+homolog detection. /opt/shared/ sanctioned by QB3 sysadmin 2026-03-09; files persist
+across reboots (no boot-time script required).
 
 ---
 

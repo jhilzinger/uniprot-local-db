@@ -3,7 +3,10 @@ data/
 
 # Built database and index
 uniprot.sqlite
+uniprot.sqlite-shm
+uniprot.sqlite-wal
 mmseqs_db/
+diamond_db/
 
 # Logs
 *.log
