@@ -44,7 +44,7 @@ hits = db.search_by_sequence(fasta_str, mode="fast", sensitivity="fast", max_hit
 # → DataFrame: uniref90_id, rep_accession, evalue, identity, coverage,
 #              interpro_ids, pfam_ids, member_count, taxonomy_id
 
-# Sensitive search — jackhmmer against UniRef50 in /opt/shared (~5–15 min)
+# Sensitive search — jackhmmer against UniRef50 in /opt/shared (~10–15 min/iter; default 3 iter)
 hits = db.search_by_sequence(fasta_str, mode="sensitive")
 hits = db.search_by_sequence(fasta_str, mode="sensitive", jackhmmer_iterations=1, max_hits=10)
 # → same DataFrame columns; identity/coverage are NaN

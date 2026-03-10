@@ -32,17 +32,22 @@ Top hits for P04637: P04637, Q9TTA1, P56423, P56424, P61260 — all TP53/p53 fam
 - Test C (1 thread):  204 MB / 9.6 s ≈ **21 MB/sec**
 - Healthy NFS: 100–200 MB/sec. **NFS throughput is degraded (~21–51 MB/sec).**
 
-## UniRef90 Projection
+## Scale Projection (NFS)
 
-| Item | Value |
-|------|-------|
-| Swiss-Prot size | 0.21 GB |
-| UniRef90 FASTA size | 84 GB |
-| Scale factor | ~400× |
-| Test B wall time | 4.0 s |
-| **Projected UniRef90 wall time** | **~27 min** |
+The production system uses UniRef50 (23 GB), not UniRef90 (84 GB). Both projections shown
+for reference. Linear I/O scaling only — actual time is higher due to HMMER compute cost.
 
-**Verdict: IMPRACTICAL** for routine use. Actual time likely worse — UniRef90's larger sequence space will trigger more iteration rounds than Swiss-Prot did.
+| Item | UniRef90 | UniRef50 (actual target) |
+|------|----------|--------------------------|
+| FASTA size | 84 GB | 23 GB |
+| Scale factor vs Swiss-Prot | ~400× | ~110× |
+| Projected wall time (Test B, 3 iter, 8 cpu) | ~27 min | ~7 min |
+| **Actual measured (1 iter, local disk)** | — | **11.6 min** |
+
+**Verdict: IMPRACTICAL on NFS** for either database. The I/O-scaling projection
+underestimates actual time because HMMER has significant per-sequence compute cost
+beyond I/O. Actual 1-iteration measured time (11.6 min) is higher than the naive
+~7 min projection for UniRef50 on local disk.
 
 ## Key Findings
 - jackhmmer is I/O-bound on NFS; 8 threads gives only ~2.4× speedup over 1 thread

@@ -150,7 +150,8 @@ this divergence level, and (b) UniRef50 is ~23 GB versus 84 GB — 3.6x smaller.
 
 - Installed at: `/usr/bin/jackhmmer` (HMMER 3.3.2)
 - UniRef50 hits are resolved to UniRef90 clusters via `idmapping.uniref50_id`
-- Typical runtime: **5–15 minutes per query** against UniRef50 in /opt/shared
+- Typical runtime: **10–15 min (1 iteration), 15–30 min (3 iter, default)** against UniRef50 in /opt/shared
+  — early termination is common when no new sequences are found on an iteration
 - `identity` and `coverage` columns are `NaN` in results (not reported by jackhmmer)
 
 ### Fast storage management
